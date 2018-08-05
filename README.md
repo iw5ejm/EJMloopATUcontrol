@@ -1,5 +1,5 @@
 # EJMloopATUcontrol
-Automatic tuning control for Loop Antenna: stepper motor control variable capacitor.
+Automatic tuning control for Loop Antenna: stepper motor controls variable capacitor.
 
 Look at the sketch for pinout.
 
