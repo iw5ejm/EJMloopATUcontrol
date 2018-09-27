@@ -17,24 +17,24 @@
 #define STEPS 2048
 
 // gear reduction coupling factor
-#define Frid 1 
+#define Frid 4 
 
 // change this to choose High and low motor speeds
 #define Hspeed 10 //High speed (RPM)
-#define Lspeed 1 // Low speed (RPM)
+#define Lspeed 3 // Low speed (RPM)
 
 // defining tuning steps
 #define Cstep 32 // Coarse step, adjust for 10° 
-#define Fstep 2 // Fine step,  adjust for 1°
+#define Fstep 4 // Fine step,  adjust for 1°
 
 #define SWR11 200 //level for 1:1 SWR read on RefPin (A0) pin
 
 // Define pin for user input
-#define TunePin 4 // this button start automatic tuning process
+#define TunePin 2 // this button start automatic tuning process
 #define UpPin 3  // this button move the capacitor to the right
-#define DwnPin 2 // this button move the capacitor to the left
-#define TuneLedPin 13 //pin for led "tuning in progress" indicator
-#define SWRokLedPin 6 //
+#define DwnPin 4 // this button move the capacitor to the left
+#define TuneLedPin 5 //pin for led "tuning in progress" indicator
+#define SWRokLedPin 13 //
 #define RefPin A0  // reflected power input
 
 // create an instance of the stepper class, specifying
@@ -44,7 +44,8 @@ Stepper stepper(STEPS, 8, 10, 9, 11);
 
 
 int bestRefl = 1023;
-int Swr_refl = 0;
+int Swr_refl_cur = 0;
+int Swr_refl_prev = 0;
 int refl = 0;
 byte  TuneRequestPin_status = (1);                                // High level is idle
 long  TuneRequestPinbuttonTime = 0;
@@ -53,15 +54,15 @@ int bestCapPos = 0;
 int HighCapPos = 0;
 int LowCapPos = 0;
 
-
 void setup() {
 
-  pinMode(RefPin, INPUT_PULLUP);
+  pinMode(RefPin, INPUT);
   pinMode(TunePin, INPUT_PULLUP);
   pinMode(UpPin, INPUT_PULLUP);
   pinMode(DwnPin, INPUT_PULLUP);
   pinMode(TuneLedPin, OUTPUT);
   pinMode(SWRokLedPin, OUTPUT);
+  pinMode(FridPin, INPUT);
 
   digitalWrite(TuneLedPin, HIGH);
   digitalWrite(SWRokLedPin, HIGH);
@@ -72,7 +73,12 @@ void setup() {
   digitalWrite(SWRokLedPin, LOW);
   
   Serial.begin(9600);
-  Serial.println("IW5EJM ATU loop controller v0.9");
+  Serial.println("IW5EJM ATU loop controller v2.1");
+  delay(2000);
+  if (!digitalRead(UpPin)&&!digitalRead(DwnPin)) {
+  Serial.println("Entering loop for reflected power measuring");  
+  while(1) {Serial.println(analogRead(RefPin)); }
+  }
 
 }
 
@@ -80,8 +86,8 @@ void loop() {
 
 waitbutton:
 
+// To verify reflected power reading:
 //Serial.print("Reflected: "); Serial.println(analogRead(RefPin));
-
   if (!digitalRead(UpPin))  {
     Serial.println("button UP pressed");    
     stepper.setSpeed(Lspeed);  // manual tuning requested
@@ -114,8 +120,9 @@ waitbutton:
   for (capPos = 0; capPos <= Frid*STEPS; capPos += Cstep) {
 
     stepper.step(Cstep);
-    Swr_refl = analogRead(RefPin);
-    refl = Swr_refl;
+    Swr_refl_prev = Swr_refl_cur;
+    Swr_refl_cur = analogRead(RefPin);
+    refl = Swr_refl_cur; //(Swr_refl_cur + Swr_refl_prev)/2;
     Serial.print("COARSE tuning, Reflected: ");  Serial.print(refl);
     Serial.print(" Pos: ");  Serial.println(capPos);
 
@@ -127,23 +134,32 @@ waitbutton:
 
     }
   }
+  
+Serial.println("COARSE ENDED");
+Serial.print("Best refl: "); Serial.println(refl);
+Serial.print("Best cap pos: "); Serial.println(bestCapPos);
+  
+  HighCapPos = 3 *Cstep;
+  LowCapPos = bestCapPos - 3 *Cstep;
+  
+  stepper.step(-(Frid*STEPS - LowCapPos));      // turn capacitor to start position
 
-  HighCapPos = 2 *Cstep;
-  LowCapPos = bestCapPos - 2 *Cstep;
-  stepper.step(-(STEPS - LowCapPos));      // turn capacitor to start position
- 
+Serial.print("Cap prepared for fine tuning, actual reflected: "); Serial.println(analogRead(RefPin));
   
   /// fine
   stepper.setSpeed(Lspeed);
 
   bestRefl = 1023;
-  
+  Swr_refl_cur = 0;
+  Swr_refl_prev = 0;
+  capPos = 0;
 
-  for (capPos = 0; capPos < (HighCapPos + 1); capPos += Fstep) {
+  for (capPos = 0; capPos < (HighCapPos); capPos += Fstep) {
 
     stepper.step(Fstep);
-    Swr_refl = analogRead(RefPin);
-    refl = Swr_refl;
+    Swr_refl_prev = Swr_refl_cur;
+    Swr_refl_cur = analogRead(RefPin);
+    refl = Swr_refl_cur; //(Swr_refl_cur + Swr_refl_prev)/2;
     Serial.print("FINE tuning, Reflected: ");  Serial.print(refl); 
     Serial.print(" Pos: ");  Serial.println(capPos);
 
@@ -155,8 +171,11 @@ waitbutton:
   }
 
   stepper.step(-(HighCapPos - bestCapPos));   // turn capacitor to best position
+
+
   digitalWrite(TuneLedPin, LOW);
   Serial.print("Tuning process ended, Reflected: "); Serial.println(refl);
+  Serial.print("Best cap pos: "); Serial.print(bestCapPos); Serial.print("/"); Serial.println(HighCapPos);
   if (bestRefl<SWR11) {
           digitalWrite(SWRokLedPin, HIGH);
           delay(500);
