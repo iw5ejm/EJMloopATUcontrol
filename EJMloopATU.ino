@@ -1,301 +1,198 @@
-// Si5351_WSPR
-//
-// Simple WSPR beacon for ESP8266, with the Etherkit or SV1AFN Si5351A Breakout
-// Board, by Jason Milldrum NT7S.
-// 
-// Original code based on Feld Hell beacon for Arduino by Mark 
-// Vandewettering K6HX, adapted for the Si5351A by Robert 
-// Liesenfeld AK6L <ak6l@ak6l.org>.  Timer setup
-// code by Thomas Knutsen LA3PNA.
-//
-// Hardware info
-// ---------------------
-// serial debug port baud rate: 74880
-// Si5351A is connected via I2C on pin D1 (SCL) and D2 (SDA) as marked on Wemos D1 mini Lite
-// freq0 is used in clock0 output, freq1 in clock1, freq2 in clock2
-// on SV1AFN board clock0 is marked J1, clock1 J2, clock2 J3.
-//
-// Hardware Requirements
-// ---------------------
-// This firmware must be run on an ESP8266 compatible board
-// testde on Wemos D1 Mini Lite
-//
-// Required Libraries
-// ------------------
-// Etherkit Si5351 (Library Manager)
-// Etherkit JTEncode (Library Manager)
-// Time (Library Manager)
-// Wire (Arduino Standard Library)
-// NTPtimeESP
-// ESP8266WiFi
-//
-// License
-// -------
-// Permission is hereby granted, free of charge, to any person obtaining
-// a copy of this software and associated documentation files (the
-// "Software"), to deal in the Software without restriction, including
-// without limitation the rights to use, copy, modify, merge, publish,
-// distribute, sublicense, and/or sell copies of the Software, and to
-// permit persons to whom the Software is furnished to do so, subject
-// to the following conditions:
-// 
-// The above copyright notice and this permission notice shall be
-// included in all copies or substantial portions of the Software.
-// 
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-// IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR
-// ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
-// CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-//
+/*
+   Loop controller by IW5EJMarco
+   A stepper motor for  loop antenna tuning
+   Credits to on7eq for the tuning algorithm
+   http://www.qsl.net/on7eq/projects/arduino_atu.htm
+   
+   reference:
+   http://www.grvdc.eu
+   http://www.arduino.cc/en/Reference/Stepper
+   This  code is in the public domain.
+*/
 
-#include <si5351.h>
-#include "Wire.h"
-#include <JTEncode.h>
-#include <int.h>
-#include <TimeLib.h>
-#include <NTPtimeESP.h>
-#include <ESP8266WiFi.h>
-#include <WiFiClient.h>
+#include <Stepper.h>
+
+// change this to the number of steps of your motor
+#define STEPS 2048
+
+// change this to adapt to your gear reduction coupling factor
+#define Frid 1 
+
+// change this to choose High and low motor speeds
+#define Hspeed 10 //High speed (RPM)
+#define Lspeed 3 // Low speed (RPM)
+
+// defining tuning steps
+#define Cstep 32 // Coarse step, adjust for 10° 
+#define Fstep 4 // Fine step,  adjust for 1°
+
+#define SWR11 20 //level for 1:1 SWR read on RefPin (A0) pin
+
+// Define pin for user input
+#define TunePin 2 // this button start automatic tuning process
+#define UpPin 3  // this button move the capacitor to the right
+#define DwnPin 4 // this button move the capacitor to the left
+#define TuneLedPin 5 //pin for led "tuning in progress" indicator
+#define SWRokLedPin 6 //
+#define RefPin A0  // reflected power input
+
+// create an instance of the stepper class, specifying
+// the number of steps of the motor and the pins it's
+// attached to
+Stepper stepper(STEPS, 8, 10, 9, 11);
 
 
-#define TONE_SPACING            146           // ~1.46 Hz
-#define WSPR_DELAY              683          // Delay value for WSPR
-#define WSPR_CTC                10672         // CTC value for WSPR
-#define SYMBOL_COUNT            WSPR_SYMBOL_COUNT
-#define CORRECTION              -12242             // Change this for your ref osc -12000 
+int bestRefl = 1023;
+int Swr_refl_cur = 0;
+int Swr_refl_prev = 0;
+int refl = 0;
+byte  TuneRequestPin_status = (1);                                // High level is idle
+long  TuneRequestPinbuttonTime = 0;
+int capPos = 0;
+int bestCapPos = 0;
+int HighCapPos = 0;
+int LowCapPos = 0;
 
-#define TX_LED_PIN              2  //integrated onboard led, marked as D4 on Wemos D1 mini lite
-#define SYNC_LED_PIN            16 //marked as D4 on Wemos D0 mini lite
+void setup() {
 
-//****************************************************
-//* SYNCRONIZE SYSTEM TIME with NTP SERVERS
-//* need to be modified, obsolete library in use...
-//****************************************************
-#define SEND_INTV     10
-#define RECV_TIMEOUT  10
+  pinMode(RefPin, INPUT);
+  pinMode(TunePin, INPUT_PULLUP);
+  pinMode(UpPin, INPUT_PULLUP);
+  pinMode(DwnPin, INPUT_PULLUP);
+  pinMode(TuneLedPin, OUTPUT);
+  pinMode(SWRokLedPin, OUTPUT);
+  pinMode(FridPin, INPUT);
 
-//If you want use more than one jack output uncomment relative define:
+  digitalWrite(TuneLedPin, HIGH);
+  digitalWrite(SWRokLedPin, HIGH);
 
-//#define clock1 //if uncommented this define enables jack 2 (clock1 of si5351) outputREMEMBER TO CHANGE FREQUENCY BELOW
+  delay(500); // Test led
 
-//#define clock2 //if uncommented this define enables jack 3 (clock1 of si5351) output
-
-
-// Global variables
-Si5351 si5351;
-JTEncode jtencode;
-
-#define MAXCH      5 //Change this according to the number of bands inserted below
-unsigned long freq0[] = {14097158UL, 10140258UL, 7040158UL, 5366258UL, 3594158UL}; //CHANGE THIS: is the freq of multiband output on jack 1 (clock0)
-
-//unsigned long freq0 = 14097158UL;                  // RFU
-#ifdef clock1
-unsigned long freq1 =  7040158UL;                // Change this: if used is the freq of single band output on jack 2 (clock1)
-#endif
-#ifdef clock2
-unsigned long freq2 = 28126158UL;                // Change this: if used is the freq of single band output on jack 3 (clock2)
-#endif
-int ch=0; // automatic frequency switch index
-bool warmup=0;
-
-char call[7] = "IW5EJM";                        // Change this
-char loc[5] = "JN53";                           // Change this
-uint8_t dbm = 10;
-uint8_t tx_buffer[SYMBOL_COUNT];
-
-const char* ssid = "SSIDofWIFI";       //SSID of your Wifi network: Change this
-const char* password = "PASSWORDofWIFI";      //Wi-Fi Password:            Change this
-
-
-//**** How the station is named in your NET
-const char* WiFi_hostname = "WSPRmultiTX";
-
-//**** Sync the soft clock every 12 hours
-#define NTPSYNC_DELAY  12
-
-//**** NTP Server to use
-const char* NTP_Server = "ntp1.inrim.it"; //italian national institute for measures
-
-//**** Your time zone UTC related (floating point number)
-#define TIME_ZONE 1.0f
-
-NTPtime NTPch(NTP_Server);   
-strDateTime dateTime;
-
-// --------------------------------------
-// epochUnixNTP set the UNIX time
-// number of seconds sice Jan 1 1970
-// --------------------------------------
-
-time_t epochUnixNTP()
-{
-    Serial.println(">>>>>>>> Time Sync function called <<<<<<<<<");
-
-//**** BIG ISSUE: in case of poor connection, we risk to remain in this loop forever
-    NTPch.setSendInterval(SEND_INTV);
-    NTPch.setRecvTimeout(RECV_TIMEOUT);
-    do
-    {
-      dateTime = NTPch.getNTPtime(TIME_ZONE, 1);
-      delay(1);
-    }
-    while(!dateTime.valid);
-    NTPch.printDateTime(dateTime);
-    setTime(dateTime.hour,dateTime.minute,dateTime.second,dateTime.day,dateTime.month,dateTime.year); 
-    Serial.println(now());
-
-  return 0;
-}
-
-
- 
-// Loop through the string, transmitting one character at a time.
-void encode()
-{
-    uint8_t i;
-
-    jtencode.wspr_encode(call, loc, dbm, tx_buffer);
-    
-    // Reset the tone to 0 and turn on the output //unused portion of code due to warmup
-    // si5351.set_clock_pwr(SI5351_CLK0, 1);
-    // si5351.set_clock_pwr(SI5351_CLK1, 1);
-    //si5351.set_clock_pwr(SI5351_CLK2, 1);
-
-    digitalWrite(TX_LED_PIN, LOW);
-    Serial.println("TX ON");
-    
-    // Now do the rest of the message
-    for(i = 0; i < SYMBOL_COUNT; i++)
-    {
-        si5351.set_freq((freq0[ch] * 100) + (tx_buffer[i] * TONE_SPACING), SI5351_CLK0);
-        
-        #ifdef clock1
-        si5351.set_freq((freq1 * 100) + (tx_buffer[i] * TONE_SPACING), SI5351_CLK1);
-        #endif
-        
-        #ifdef clock2
-        si5351.set_freq((freq2 * 100) + (tx_buffer[i] * TONE_SPACING), SI5351_CLK2);
-        #endif
-
-      delay(WSPR_DELAY);
-
-    }
-        
-    // Turn off the output
-    si5351.set_clock_pwr(SI5351_CLK0, 0);
-    #ifdef clock1
-    si5351.set_clock_pwr(SI5351_CLK1, 0);
-    #endif
-    #ifdef clock2
-    si5351.set_clock_pwr(SI5351_CLK2, 0);
-    #endif
-    
-    digitalWrite(TX_LED_PIN, HIGH);
-    Serial.println("TX OFF");
-    ch++;
-    if (ch==MAXCH) ch=0;
-}
-
-void ssidConnect()
-{
-  Serial.println(ssid);
-  Serial.println(password);
-  WiFi.begin(ssid, password);
- 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(700);
-    Serial.print(".");
+  digitalWrite(TuneLedPin, LOW);
+  digitalWrite(SWRokLedPin, LOW);
+  
+  Serial.begin(9600);
+  Serial.println("IW5EJM ATU loop controller v2.1");
+  delay(2000);
+   
+  if (!digitalRead(UpPin)&&!digitalRead(DwnPin)) //press up&down button at boot to test reflected power reading
+  {
+   Serial.println("Entering loop for reflected power measuring");  
+   while(1) {Serial.println(analogRead(RefPin)); }
   }
-     
-  Serial.println();
-  Serial.print(F("Connected to "));
-  Serial.println(ssid);
-  Serial.print(F("IP address: "));
-  Serial.println(WiFi.localIP());
+
 }
- 
-void setup()
-{
-  Serial.begin(74880); while (!Serial);
-  Serial.println("COM setup successful");
-  delay(10);
 
-  WiFi.mode(WIFI_STA);
-  // connect to WiFi network
-  ssidConnect();
-  
-  
-  // Use the LED as a keying indicator.
-  pinMode(TX_LED_PIN, OUTPUT);
-  pinMode(SYNC_LED_PIN, OUTPUT);
-  digitalWrite(TX_LED_PIN, HIGH);
-  digitalWrite(SYNC_LED_PIN, HIGH);
+void loop() {
 
-  // Set time sync provider
-  setSyncProvider(epochUnixNTP);  //set function to call when sync required 
+waitbutton:
+
+// To verify reflected power reading:
+//Serial.print("Reflected: "); Serial.println(analogRead(RefPin));
+   
+  if (!digitalRead(UpPin))  {
+    Serial.println("button UP pressed");    
+    stepper.setSpeed(Lspeed);  // manual tuning requested
+    stepper.step(Fstep);
+  //  if (analogRead(RefPin)<<SWR11) digitalWrite(SWRokLedPin, HIGH); else   digitalWrite(SWRokLedPin, LOW);
+  }
+
+  
+  if (!digitalRead(DwnPin)) {
+    Serial.println("button DOWN pressed");
+    stepper.setSpeed(Lspeed);
+    stepper.step(-Fstep);
+  //  if (analogRead(RefPin)<<SWR11) digitalWrite(SWRokLedPin, HIGH); else   digitalWrite(SWRokLedPin, LOW);
+  }
+
+  if (digitalRead(TunePin)) goto waitbutton;
+
+
+  //Start tuning process
+  Serial.println("Automatic tuning requested");
+
+  digitalWrite(TuneLedPin, HIGH);
+  digitalWrite(SWRokLedPin, LOW);
+  stepper.setSpeed(Hspeed);
+  
+  ///// find best reflection  /////
+
+  /// coarse
+
+  for (capPos = 0; capPos <= Frid*STEPS; capPos += Cstep) {
+
+    stepper.step(Cstep);
+    //Swr_refl_prev = Swr_refl_cur;
+    Swr_refl_cur = analogRead(RefPin);
+    refl = Swr_refl_cur; //(Swr_refl_cur + Swr_refl_prev)/2;
+    Serial.print("COARSE tuning, Reflected: ");  Serial.print(refl);
+    Serial.print(" Pos: ");  Serial.println(capPos);
+
     
-  // Initialize the Si5351
-  // Change the 2nd parameter in init if using a ref osc other
-  // than 25 MHz
-  Serial.println("start radio module setup");
-  si5351.init(SI5351_CRYSTAL_LOAD_8PF, 27000000UL, CORRECTION);
-  Serial.println("Module intializated");
-
-  
-  // Set CLK0 output
-  si5351.set_freq(freq0[ch] * 100, SI5351_CLK0);
-  si5351.drive_strength(SI5351_CLK0, SI5351_DRIVE_8MA); // Set for max power
-  si5351.set_clock_pwr(SI5351_CLK0, 0); // Disable the clock initially
-
-#ifdef clock1
- // Set CLK1 output
-  si5351.set_freq(freq1 * 100, SI5351_CLK1);
-  si5351.drive_strength(SI5351_CLK1, SI5351_DRIVE_8MA); // Set for max power
-  si5351.set_clock_pwr(SI5351_CLK1, 0); // Disable the clock initially
-#endif
-
-#ifdef clock2
- // Set CLK2 output
-  si5351.set_freq(freq2 * 100, SI5351_CLK2);
-  si5351.drive_strength(SI5351_CLK2, SI5351_DRIVE_8MA); // Set for max power
-  si5351.set_clock_pwr(SI5351_CLK2, 0); // Disable the clock initially
-#endif
-
-  Serial.println("Radio Module setup successful");
-  Serial.println("Entering loop...");
-}
- 
-void loop()
-{  
-
-  // Trigger every 5 minute
-  // WSPR should start on the 1st second of the minute, but there's a slight delay
-  // in this code because it is limited to 1 second resolution.
-  
-  // 30 seconds before enable si5351a output to eliminate startup drift
-  if((minute() + 1) % 5 == 0 && second() == 30 && !warmup)
-    { warmup=1;
-    
-      si5351.set_freq(freq0[ch] * 100, SI5351_CLK0);
-      si5351.set_clock_pwr(SI5351_CLK0, 1);
-      
-      #ifdef clock1
-      si5351.set_clock_pwr(SI5351_CLK1, 1);
-      #endif
-      #ifdef clock2
-      si5351.set_clock_pwr(SI5351_CLK2, 1);
-      #endif
+    if (refl > 999) refl = 999;
+    if (refl < bestRefl) {
+      bestRefl = refl;
+      bestCapPos = capPos;
 
     }
-
-  if(minute() % 5 == 0 && second() == 0)
-    {
-      Serial.println(now());
-      encode();
-      warmup=0;
-      delay(1000);
-     }
   }
+  
+Serial.println("COARSE TUNING ENDED");
+Serial.print("Best refl: "); Serial.println(refl);
+Serial.print("Best cap pos: "); Serial.println(bestCapPos);
+  
+HighCapPos = 3 *Cstep;
+LowCapPos = bestCapPos - 3 *Cstep;
+  
+stepper.step(-(Frid*STEPS - LowCapPos));      // turn capacitor to start position
+
+Serial.print("Cap prepared for fine tuning, actual reflected: "); Serial.println(analogRead(RefPin));
+  
+  /// fine
+  stepper.setSpeed(Lspeed);
+
+  bestRefl = 1023;
+  //Swr_refl_cur = 0;
+ // Swr_refl_prev = 0;
+  capPos = 0;
+
+  for (capPos = 0; capPos < (HighCapPos); capPos += Fstep) {
+
+    stepper.step(Fstep);
+    //Swr_refl_prev = Swr_refl_cur;
+    Swr_refl_cur = analogRead(RefPin);
+    refl = Swr_refl_cur; //(Swr_refl_cur + Swr_refl_prev)/2;
+    Serial.print("FINE tuning, Reflected: ");  Serial.print(refl); 
+    Serial.print(" Pos: ");  Serial.println(capPos);
+
+    if (refl > 999) refl = 999;
+    if (refl < bestRefl) {
+      bestRefl = refl;
+      bestCapPos = capPos;
+    }
+  }
+
+  stepper.step(-(HighCapPos - bestCapPos));   // turn capacitor to best position
+
+
+  digitalWrite(TuneLedPin, LOW);
+  Serial.print("Tuning process ended, Reflected: "); Serial.println(refl);
+  Serial.print("Best cap pos: "); Serial.print(bestCapPos); Serial.print("/"); Serial.println(HighCapPos);
+  if (bestRefl<SWR11) {
+          digitalWrite(SWRokLedPin, HIGH);
+          delay(500);
+          digitalWrite(SWRokLedPin, LOW);
+          delay(200);
+          digitalWrite(SWRokLedPin, HIGH);
+          delay(200);          
+          digitalWrite(SWRokLedPin, LOW);
+          delay(200);
+          digitalWrite(SWRokLedPin, HIGH);
+          delay(200);
+          digitalWrite(SWRokLedPin, LOW);
+          delay(200);
+          digitalWrite(SWRokLedPin, HIGH);
+          delay(200);
+          digitalWrite(SWRokLedPin, LOW);
+          }
+}
